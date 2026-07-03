@@ -1,33 +1,61 @@
+
+
 package main
 
 import (
-	"encoding/csv"
-	"os"
+	"database/sql"
+	"fmt"
+	"net/smtp"
+	"sync"
+	"time"
 )
 
-func loadRecipient(filePath string, ch chan Recipient) error {
-	defer close(ch)
-	
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+func emailWorker(id int, ch chan Recipient, wg *sync.WaitGroup, dlq chan DLQ, db *sql.DB, cfg Config, shutdown <-chan struct{}) {
+	defer wg.Done()
+	for {
+		select {
+		case <-shutdown:
+			fmt.Printf("Worker %d shutting down...\n", id)
+			return
+		case recipient, ok := <-ch:
+			if !ok {
+				return
+			}
+			msg, err := executeTemplate(recipient, cfg.TemplatePath)
+			if err != nil {
+				fmt.Printf("Woker: %d error parsing template for %s", id, recipient.Email)
+				failure := DLQ{
+					Recipient:   recipient,
+					Error:       err.Error(),
+					FailedAt:    time.Now(),
+					FailureType: "template_error",
+					Attempts:    1,
+				}
+				dlq <- failure
+				logFailedEmail(db, failure)
+				continue
+			}
 
-	r := csv.NewReader(f)
-	records, err := r.ReadAll()
-	if err != nil {
-		return err
-	}
+			fmt.Printf("worker %d: Sending email to %s \n", id, recipient.Email)
+			err = smtp.SendMail(cfg.SMTPHost+":"+cfg.SMTPPort, nil, cfg.SenderEmail, []string{recipient.Email}, []byte(msg))
+			if err != nil {
+				failure := DLQ{
+					Recipient:   recipient,
+					Error:       err.Error(),
+					FailedAt:    time.Now(),
+					FailureType: "smtp_error",
+					Attempts:    1,
+				}
+				dlq <- failure
+				logFailedEmail(db, failure)
+				continue
+			}
+			time.Sleep(cfg.SendDelay)
 
-	for _, record := range records[1:] {
-
-		ch <- Recipient{
-			Name:  record[0],
-			Email: record[1],
+			if err == nil {
+				logSuccessfulEmail(db, recipient)
+				fmt.Printf("worker %d: Sent email to %s \n", id, recipient.Email)
+			}
 		}
-		//send -> consumer -> channels
 	}
-
-	return nil
 }

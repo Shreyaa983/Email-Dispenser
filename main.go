@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"html/template"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -36,18 +39,29 @@ func main() {
 	}
 	defer db.Close()
 
+	signalChan := make(chan os.Signal, 1)
+	shutdown := make(chan struct{})
+
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-signalChan
+		fmt.Println("\nShutdown signal received...")
+		close(shutdown)
+	}()
+
 	recipientChannel := make(chan Recipient)
 	dlqChannel := make(chan DLQ)
 
 	go func() {
-		loadRecipient(cfg.EmailsCSVPath, recipientChannel)
+		loadRecipient(cfg.EmailsCSVPath, recipientChannel,shutdown)
 	}()
 
 	var wg sync.WaitGroup
 
 	for i := 1; i <= cfg.WorkerCount; i++ {
 		wg.Add(1)
-		go emailWorker(i, recipientChannel, &wg, dlqChannel, db, cfg)
+		go emailWorker(i, recipientChannel, &wg, dlqChannel, db, cfg,shutdown)
 
 	}
 
